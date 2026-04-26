@@ -1,0 +1,6 @@
+btc_1h_cache.csv
+trade_log.csv
+equity_curve.png
+graphify-out/
+__pycache__/
+*.pyc
