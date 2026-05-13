@@ -137,7 +137,7 @@ def main():
             circuit_breaker = False
 
         if not in_position and not circuit_breaker and atr > 0:
-            if price > ema200 and ema21 > ema55 and 45 <= rsi <= 70:
+            if price > ema200 and ema21 > ema55 and 50 <= rsi <= 70:
                 sl_price = price - 2.0 * atr
                 tp_price = price + 6.0 * atr   # 1:3 R:R with wider stops
                 risk_amt = capital * 0.015      # 1.5% risk per trade

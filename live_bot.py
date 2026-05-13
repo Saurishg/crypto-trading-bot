@@ -18,6 +18,9 @@ SYMBOL     = 'BTCUSDT'
 RISK_PCT   = 0.015   # 1.5% risk per trade
 ATR_SL     = 2.0     # stop loss = 2×ATR
 ATR_TP     = 6.0     # take profit = 6×ATR (1:3 R:R)
+RSI_LO     = 50      # only enter when momentum building
+RSI_HI     = 70      # not overbought
+MIN_HOLD   = 24      # minimum bars before EMA exit
 STATE_FILE = Path(__file__).parent / 'live_state.json'
 
 sys.path.insert(0, '/home/work/fraqtoos')
@@ -190,7 +193,7 @@ def run():
         entry_signal = (
             price > ema200 and
             ema21 > ema55 and
-            45 <= rsi <= 70
+            RSI_LO <= rsi <= RSI_HI
         )
 
         print(f'  No position | Signal: {"✅ ENTRY" if entry_signal else "❌ wait"}')
