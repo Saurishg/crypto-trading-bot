@@ -28,7 +28,7 @@ HERE       = Path(__file__).parent
 CACHE_PATH = HERE / "btc_1h_cache.csv"
 EQUITY_PNG = HERE / "equity_curve.png"
 TRADES_CSV = HERE / "trade_log.csv"
-WINDOW_DAYS = 730
+WINDOW_DAYS = 1460
 
 
 def load_cached() -> pd.DataFrame:
@@ -196,7 +196,7 @@ def main():
     profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
 
     print(f"\n{'='*45}")
-    print(f"  BTC EMA21/55 Strategy — 2-Year Backtest")
+    print(f"  BTC EMA21/55 Strategy — 4-Year Backtest")
     print(f"{'='*45}")
     print(f"  Total Return:   {total_return:>10.2f}%")
     print(f"  Sharpe Ratio:   {sharpe:>10.2f}")
