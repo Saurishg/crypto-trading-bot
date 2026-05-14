@@ -77,11 +77,14 @@ def calc_indicators(klines: list) -> dict:
     lows   = [float(k[3]) for k in klines]
 
     def ema(data, n):
-        k = 2 / (n + 1)
-        e = data[0]
-        for p in data[1:]:
-            e = p * k + e * (1 - k)
+        k = 2 / (n + 1); e = data[0]
+        for p in data[1:]: e = p * k + e * (1 - k)
         return e
+
+    def ema_arr(data, n):
+        k = 2/(n+1); out = [data[0]]
+        for p in data[1:]: out.append(p*k + out[-1]*(1-k))
+        return out
 
     def atr(h, l, c, n=14):
         trs = [max(h[i]-l[i], abs(h[i]-c[i-1]), abs(l[i]-c[i-1])) for i in range(1, len(h))]
@@ -90,17 +93,23 @@ def calc_indicators(klines: list) -> dict:
     def rsi(data, n=14):
         gains = [max(data[i]-data[i-1], 0) for i in range(1, len(data))]
         losses = [max(data[i-1]-data[i], 0) for i in range(1, len(data))]
-        ag = sum(gains[-n:]) / n
-        al = sum(losses[-n:]) / n
+        ag = sum(gains[-n:]) / n; al = sum(losses[-n:]) / n
         return 100 - (100 / (1 + ag / al)) if al > 0 else 100
 
+    # MACD
+    fast = ema_arr(closes, 12); slow = ema_arr(closes, 26)
+    macd_line = [f - s for f, s in zip(fast, slow)]
+    macd_sig  = ema_arr(macd_line, 9)
+
     return {
-        'price':  closes[-1],
-        'ema21':  ema(closes[-50:],  21),
-        'ema55':  ema(closes[-100:], 55),
-        'ema200': ema(closes,       200),
-        'atr':    atr(highs, lows, closes),
-        'rsi':    rsi(closes),
+        'price':    closes[-1],
+        'ema21':    ema(closes[-50:],  21),
+        'ema55':    ema(closes[-100:], 55),
+        'ema200':   ema(closes,       200),
+        'atr':      atr(highs, lows, closes),
+        'rsi':      rsi(closes),
+        'macd':     macd_line[-1],
+        'macd_sig': macd_sig[-1],
     }
 
 
@@ -152,7 +161,10 @@ def run():
     state  = load_state()
     pos    = get_position()
 
-    print(f'  Price: ${price:,.2f} | EMA21: {ema21:,.0f} | EMA55: {ema55:,.0f} | EMA200: {ema200:,.0f} | RSI: {rsi:.1f}')
+    macd    = ind['macd']
+    macd_sig= ind['macd_sig']
+
+    print(f'  Price: ${price:,.2f} | EMA21: {ema21:,.0f} | EMA55: {ema55:,.0f} | EMA200: {ema200:,.0f} | RSI: {rsi:.1f} | MACD: {"▲" if macd>macd_sig else "▼"}')
 
     if pos:
         # Check exit conditions
@@ -193,7 +205,8 @@ def run():
         entry_signal = (
             price > ema200 and
             ema21 > ema55 and
-            RSI_LO <= rsi <= RSI_HI
+            RSI_LO <= rsi <= RSI_HI and
+            macd > macd_sig          # MACD confirms momentum
         )
 
         print(f'  No position | Signal: {"✅ ENTRY" if entry_signal else "❌ wait"}')
