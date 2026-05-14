@@ -164,7 +164,23 @@ def run():
     macd    = ind['macd']
     macd_sig= ind['macd_sig']
 
-    print(f'  Price: ${price:,.2f} | EMA21: {ema21:,.0f} | EMA55: {ema55:,.0f} | EMA200: {ema200:,.0f} | RSI: {rsi:.1f} | MACD: {"▲" if macd>macd_sig else "▼"}')
+    # News sentiment (refresh every 4h)
+    news = state.get('news', {'score': 0, 'confidence': 0, 'reason': 'not fetched'})
+    last_news = state.get('last_news_ts', '')
+    if not last_news or (datetime.now() - datetime.fromisoformat(last_news)).seconds > 14400:
+        try:
+            from news_sentiment import get_news_signal
+            news = get_news_signal()
+            state['news'] = news
+            state['last_news_ts'] = datetime.now().isoformat()
+            save_state(state)
+        except Exception as e:
+            print(f'  News fetch failed: {e}')
+
+    news_score = news.get('score', 0)
+    news_emoji = '🟢' if news_score > 0 else '🔴' if news_score < 0 else '🟡'
+
+    print(f'  Price: ${price:,.2f} | EMA21: {ema21:,.0f} | EMA55: {ema55:,.0f} | EMA200: {ema200:,.0f} | RSI: {rsi:.1f} | MACD: {"▲" if macd>macd_sig else "▼"} | News: {news_emoji}{news_score:+d}')
 
     if pos:
         # Check exit conditions
@@ -206,8 +222,12 @@ def run():
             price > ema200 and
             ema21 > ema55 and
             RSI_LO <= rsi <= RSI_HI and
-            macd > macd_sig          # MACD confirms momentum
+            macd > macd_sig and          # MACD confirms momentum
+            news_score >= 0              # skip on bearish news
         )
+
+        # Boost position size on strong bullish news
+        risk = RISK_PCT * (1.3 if news_score > 0 and news.get('confidence', 0) >= 0.7 else 1.0)
 
         print(f'  No position | Signal: {"✅ ENTRY" if entry_signal else "❌ wait"}')
 
@@ -215,7 +235,7 @@ def run():
             usdt = get_balance()
             sl_price = price - ATR_SL * atr
             tp_price = price + ATR_TP * atr
-            risk_amt = usdt * RISK_PCT
+            risk_amt = usdt * risk
             qty = round(risk_amt / (price - sl_price), 5)
             max_qty = round(usdt * 0.95 / price, 5)
             qty = min(qty, max_qty)
