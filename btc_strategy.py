@@ -29,6 +29,7 @@ CACHE_PATH = HERE / "btc_1h_cache.csv"
 EQUITY_PNG = HERE / "equity_curve.png"
 TRADES_CSV = HERE / "trade_log.csv"
 WINDOW_DAYS = 1460
+FEE_RATE   = 0.00075  # 0.075% with BNB discount  # 0.1% per side
 
 
 def load_cached() -> pd.DataFrame:
@@ -148,7 +149,7 @@ def main():
                 position_size = min(risk_amt / (price - sl_price), capital * 0.95 / price)
                 if capital > 0 and position_size > 0:
                     entry_price = price; stop_loss = sl_price; take_profit = tp_price
-                    capital -= position_size * entry_price
+                    capital -= position_size * entry_price * (1 + FEE_RATE)
                     in_position = True; bars_held = 0
                     trade_log.append({'ts': df['timestamp'].iloc[i], 'action': 'BUY',
                                       'price': entry_price, 'sl': stop_loss, 'tp': take_profit})
@@ -169,7 +170,7 @@ def main():
             )
             if exit_triggered:
                 pnl = position_size * (price - entry_price)
-                capital += position_size * entry_price + pnl
+                capital += position_size * entry_price + pnl - FEE_RATE * price * position_size
                 in_position = False; total_trades += 1
                 if pnl > 0: wins += 1
                 else: losses += 1
@@ -181,7 +182,7 @@ def main():
     if in_position:
         price = df['close'].iloc[-1]
         pnl = position_size * (price - entry_price)
-        capital += position_size * entry_price + pnl
+        capital += position_size * entry_price + pnl - FEE_RATE * price * position_size
         total_trades += 1
         if pnl > 0: wins += 1
         else: losses += 1
