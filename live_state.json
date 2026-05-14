@@ -1,21 +1,8 @@
 {
-  "news": {
-    "score": 1,
-    "confidence": 0.75,
-    "reason": "The headlines indicate positive developments in the crypto space, such as successful recovery of Bitcoin and increased long-term conviction among buyers.",
-    "headlines": [
-      "Cointelegraph.com News",
-      "AI chatbot Claude helps man recover 5 Bitcoin after finding old seed phrase",
-      "Only 4% of Americans weigh crypto when placing their votes: Poll",
-      "Here\u2019s what happened in crypto today",
-      "Coinbase CEO Brian Armstrong gets behind CLARITY Act ahead of Thursday markup",
-      "Ethereum app builder Consensys has delayed its potential IPO until fall",
-      "The Protocol: Solana\u2019s \u2018Alpenglow\u2019 upgrade is live for testing",
-      "Metaplanet delays preferred share listing amid challenging Japanese market structure",
-      "UK parliament to probe Nigel Farage\u2019s $6.8 million donation from crypto billionaire",
-      "Bitcoin buyers with long-term 'conviction' surges 300% with most recent buyers sitting on profits"
-    ],
-    "timestamp": "2026-05-14T04:25:58.935297+00:00"
-  },
-  "last_news_ts": "2026-05-14T09:55:58.935429"
+  "entry_price": 81412.31,
+  "stop_loss": 79592.62,
+  "take_profit": 86822.18,
+  "qty": 0.0415,
+  "bars_held": 0,
+  "entered_at": "2026-05-14T21:47:21.127557"
 }
