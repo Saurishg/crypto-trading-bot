@@ -333,4 +333,15 @@ def _run():
 
 
 if __name__ == '__main__':
-    run()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--loop', action='store_true', help='Run continuously every 5 minutes')
+    args = parser.parse_args()
+
+    if args.loop:
+        print('Running in loop mode (every 5 minutes)...')
+        while True:
+            run()
+            time.sleep(300)
+    else:
+        run()
