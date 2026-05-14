@@ -202,7 +202,7 @@ def get_news(state: dict) -> tuple[float, dict]:
     """Returns (weighted_score, news_dict). Score is confidence-weighted: -1 to +1."""
     news = state.get('news', {'score': 0, 'confidence': 0.5, 'reason': 'not fetched'})
     last = state.get('last_news_ts', '')
-    if not last or (datetime.now() - datetime.fromisoformat(last)).seconds > 14400:
+    if not last or (datetime.now() - datetime.fromisoformat(last)).total_seconds() > 14400:
         try:
             from news_sentiment import get_news_signal
             news = get_news_signal()
@@ -220,9 +220,11 @@ def get_news(state: dict) -> tuple[float, dict]:
 def run():
     if not acquire_lock():
         print('Another instance running — skipping'); return
-
     try:
         _run()
+    except Exception as e:
+        notify(f'🚨 Bot crashed: {e}')
+        raise
     finally:
         release_lock()
 
@@ -277,6 +279,10 @@ def _run():
         if exit_signal:
             reason = 'SL' if price <= sl else 'TP' if price >= tp else 'EMA cross'
             result = place_order('SELL', pos['qty'])
+            if result.get('status') != 'FILLED':
+                notify(f'⚠️ SELL order failed: {result}')
+                save_state(state)
+                return
             pnl = (price - entry) * pos['qty']
             pnl_net = pnl - 2 * FEE_RATE * price * pos['qty']
             log_trade('SELL', price, pos['qty'], pnl, reason)

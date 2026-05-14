@@ -25,11 +25,12 @@ import ta
 import matplotlib.pyplot as plt
 
 HERE       = Path(__file__).parent
-CACHE_PATH = HERE / "btc_1h_cache.csv"
+CACHE_PATH = HERE / "btc_4h_cache.csv"
 EQUITY_PNG = HERE / "equity_curve.png"
 TRADES_CSV = HERE / "trade_log.csv"
 WINDOW_DAYS = 1460
-FEE_RATE   = 0.00075  # 0.075% with BNB discount  # 0.1% per side
+FEE_RATE   = 0.00075
+SLIPPAGE   = 0.0005   # 0.05% market order slippage
 
 
 def load_cached() -> pd.DataFrame:
@@ -58,7 +59,7 @@ def fetch_ohlc() -> pd.DataFrame:
         if not batch:
             break
         new_ohlc += batch
-        since = batch[-1][0] + 3600000
+        since = batch[-1][0] + 14400000
         if len(new_ohlc) >= 20000:
             break
 
@@ -149,7 +150,7 @@ def main():
                 position_size = min(risk_amt / (price - sl_price), capital * 0.95 / price)
                 if capital > 0 and position_size > 0:
                     entry_price = price; stop_loss = sl_price; take_profit = tp_price
-                    capital -= position_size * entry_price * (1 + FEE_RATE)
+                    capital -= position_size * entry_price * (1 + FEE_RATE + SLIPPAGE)
                     in_position = True; bars_held = 0
                     trade_log.append({'ts': df['timestamp'].iloc[i], 'action': 'BUY',
                                       'price': entry_price, 'sl': stop_loss, 'tp': take_profit})
@@ -166,11 +167,11 @@ def main():
             exit_triggered = (
                 price <= stop_loss or
                 price >= take_profit or
-                (bars_held >= 24 and ema21 < ema55 and rsi > 75)
+                (bars_held >= 6 and ema21 < ema55 and rsi > 75)
             )
             if exit_triggered:
                 pnl = position_size * (price - entry_price)
-                capital += position_size * entry_price + pnl - FEE_RATE * price * position_size
+                capital += position_size * entry_price + pnl - (FEE_RATE + SLIPPAGE) * price * position_size
                 in_position = False; total_trades += 1
                 if pnl > 0: wins += 1
                 else: losses += 1
@@ -182,7 +183,7 @@ def main():
     if in_position:
         price = df['close'].iloc[-1]
         pnl = position_size * (price - entry_price)
-        capital += position_size * entry_price + pnl - FEE_RATE * price * position_size
+        capital += position_size * entry_price + pnl - (FEE_RATE + SLIPPAGE) * price * position_size
         total_trades += 1
         if pnl > 0: wins += 1
         else: losses += 1
