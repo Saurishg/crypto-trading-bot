@@ -3,6 +3,25 @@
   "stop_loss": 79592.62,
   "take_profit": 86822.18,
   "qty": 0.0415,
-  "bars_held": 0,
-  "entered_at": "2026-05-14T21:47:21.127557"
+  "bars_held": 35,
+  "entered_at": "2026-05-14T21:47:21.127557",
+  "news": {
+    "score": 0,
+    "confidence": 0.7,
+    "reason": "The headlines present a mixed sentiment with both positive and negative developments in the BTC market.",
+    "headlines": [
+      "Bitcoin holds key support for $85K breakout as S&P 500 hits new all-time high",
+      "CoinDesk 20 performance update: BNB is only gainer as index drops 2%",
+      "XRP gives back gains after Senate crypto bill sparks 5% rally",
+      "Strategy to repurchase $1.5 billion of 2029 convertible bonds using cash or bitcoin sales",
+      "Winklevoss\u2019 Gemini jumps 25% on $100 million bitcoin infusion despite deepening losses",
+      "OKX, Korea Investment and Securities said to be in talks for 40% of Coinone",
+      "Bitcoin Shrugs Off CLARITY Gains as Institutions Sell Amid Surging Treasury Yields",
+      "Dune Analytics Slashes 25% of Workforce in AI, Institutional Pivot",
+      "Morning Minute: The Clarity Act Just Passed Its First Major Vote",
+      "THORChain\u2019s RUNE Token Plunges Double Digits After $10M Exploit, Trading Halt"
+    ],
+    "timestamp": "2026-05-15T13:38:07.817546+00:00"
+  },
+  "last_news_ts": "2026-05-15T19:08:07.817686"
 }
