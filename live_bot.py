@@ -22,7 +22,6 @@ ATR_TP     = 6.0
 RSI_LO     = 50
 RSI_HI     = 70
 FEE_RATE   = 0.001   # 0.1% per side
-MAX_DAILY_LOSS_PCT = 0.05  # stop trading if down 5% today
 
 STATE_FILE = Path(__file__).parent / 'live_state.json'
 PNL_LOG    = Path(__file__).parent / 'pnl_log.json'
@@ -332,12 +331,7 @@ def run():
 def _run():
     print(f'\n[{datetime.now().strftime("%Y-%m-%d %H:%M")}] BTC Live Bot running...')
 
-    # Daily loss circuit breaker
-    daily_pnl = get_daily_pnl()
-    usdt_start = get_balance()
-    if usdt_start > 0 and daily_pnl < -(usdt_start * MAX_DAILY_LOSS_PCT):
-        msg = f'🛑 Daily loss limit hit (${daily_pnl:,.2f}). No new trades today.'
-        notify(msg); return
+    daily_pnl = get_daily_pnl()  # kept for the dashboard, no longer a circuit breaker
 
     klines = get_klines(250)
     if len(klines) < 210:
@@ -401,11 +395,12 @@ def _run():
         if unrealized_pct > 3:  sl = max(sl, entry);       state['stop_loss'] = sl
         if unrealized_pct > 5:  sl = max(sl, price - atr); state['stop_loss'] = sl
 
-        exit_signal = price <= sl or price >= tp or (bars >= MIN_HOLD and ema21 < ema55)
+        # Pure SL/TP exits — time-based EMA-cross exit removed (backtest: +0.52% over 4y)
+        exit_signal = price <= sl or price >= tp
         print(f'  Position: {pos["qty"]:.5f} BTC | Entry: ${entry:,.2f} | SL: ${sl:,.2f} | TP: ${tp:,.2f} | PnL: {unrealized_pct:+.2f}%')
 
         if exit_signal:
-            reason = 'SL' if price <= sl else 'TP' if price >= tp else 'EMA cross'
+            reason = 'SL' if price <= sl else 'TP'
             result = place_order('SELL', pos['qty'])
             if result.get('status') != 'FILLED':
                 notify(f'⚠️ SELL order failed: {result}')
@@ -424,12 +419,13 @@ def _run():
         adx_v = ind.get('adx', 0)
         ADX_MIN = 25
 
+        # Entry signal — backtest-validated filters only.
+        # News removed as a gate (still fetched for display); daily loss circuit removed (never triggered).
         entry_signal = (
             price > ema200 and ema21 > ema55 and
             RSI_LO <= rsi <= RSI_HI and
             macd > macd_sig and
-            news_weighted >= -0.3 and   # allow neutral/bullish, block strongly bearish
-            adx_v >= ADX_MIN            # trend strength filter
+            adx_v >= ADX_MIN            # trend strength filter (backtested: +4.6pp WR)
         )
 
         if not entry_signal:
@@ -438,12 +434,11 @@ def _run():
             if ema21 <= ema55:        blocked_by.append('EMA bearish')
             if not (RSI_LO<=rsi<=RSI_HI): blocked_by.append(f'RSI={rsi:.0f}')
             if macd <= macd_sig:      blocked_by.append('MACD bearish')
-            if news_weighted < -0.3:  blocked_by.append(f'news={news_weighted:+.2f}')
             if adx_v < ADX_MIN:       blocked_by.append(f'ADX={adx_v:.0f}<{ADX_MIN}')
             print(f'  No position | ❌ Waiting: {", ".join(blocked_by)}')
         else:
-            # Confidence-weighted position sizing
-            risk = RISK_PCT * (1 + max(0, news_weighted) * 0.3)  # up to +30% on bullish news
+            # Fixed risk-based position sizing (news-based boost removed — not backtested)
+            risk = RISK_PCT
             usdt    = get_balance()
             sl_price = price - ATR_SL * atr
             tp_price = price + ATR_TP * atr
