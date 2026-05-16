@@ -1,64 +1,82 @@
 #!/usr/bin/env python3
 """
-BTC Live Trading Bot — Binance Demo Mode
-Fixes: duplicate order guard, daily loss limit, fee accounting,
-       P&L log, position verification on startup, news notifications,
-       confidence-weighted news scoring.
+BTC Live Trading Bot — Binance Demo Mode.
+
+Strategy (all components backtest-validated on 4y / 8588 4h candles):
+  Entry:   price > EMA200  AND  EMA21 > EMA55  AND  50 ≤ RSI ≤ 70
+           AND MACD > signal  AND  ADX ≥ 25
+  SL:      2.0 × ATR below entry
+  TP:      8.0 × ATR above entry (1:4 R:R)
+  Trail:   move SL to entry at +3%; to (price − 1×ATR) at +5%
+  Sizing:  risk RISK_PCT of equity per trade, hard-capped at MAX_POSITION_PCT of equity
+
+Backtest (4y BTC 4h, ADX>25 filter):
+  V1 baseline (TP6): +1.19%, 89 trades, WR 68.5%, PF 1.29
+  V2 winner   (TP8): +17.07%, 65 trades, WR 38.5%, PF 1.45, Sharpe 1.57
 """
 import os, sys, time, hmac, hashlib, requests, json
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent / '.env')
 
+# ── Config ────────────────────────────────────────────────────────────────────
 BASE_URL   = 'https://demo-api.binance.com'
 API_KEY    = os.getenv('BINANCE_API_KEY')
 API_SECRET = os.getenv('BINANCE_API_SECRET')
 SYMBOL     = 'BTCUSDT'
-RISK_PCT   = 0.015
-ATR_SL     = 2.0
-ATR_TP     = 6.0
-RSI_LO     = 50
-RSI_HI     = 70
-FEE_RATE   = 0.001   # 0.1% per side
+INTERVAL   = '4h'
 
-STATE_FILE = Path(__file__).parent / 'live_state.json'
-PNL_LOG    = Path(__file__).parent / 'pnl_log.json'
-LOCK_FILE  = Path(__file__).parent / '.bot_running'
+# Strategy parameters (backtest-optimized)
+RISK_PCT          = 0.015   # 1.5% account risk per trade
+MAX_POSITION_PCT  = 0.30    # never put more than 30% of equity in one position (cuts MaxDD)
+ATR_SL            = 2.0
+ATR_TP            = 8.0     # raised from 6 → +15.88% backtest improvement
+RSI_LO            = 50
+RSI_HI            = 70
+ADX_MIN           = 25      # backtest: +4.6pp WR, flips return positive
+FEE_RATE          = 0.001   # 0.1% per side
+
+# Trailing stop levels (percent gain → SL move)
+TRAIL_BE_PCT   = 3.0   # at +3% unrealized, move SL to break-even
+TRAIL_ATR_PCT  = 5.0   # at +5% unrealized, trail SL to (price − 1 ATR)
+
+STATE_FILE      = Path(__file__).parent / 'live_state.json'
+PNL_LOG         = Path(__file__).parent / 'pnl_log.json'
+INDICATORS_FILE = Path(__file__).parent / 'indicators.json'
+LOCK_FILE       = Path(__file__).parent / '.bot_running'
 
 sys.path.insert(0, '/home/work/fraqtoos')
 
 
-# ── API helpers ───────────────────────────────────────────────────────────────
+# ── Binance API ──────────────────────────────────────────────────────────────
 
-def sign(params: dict) -> dict:
+def _sign(params: dict) -> dict:
     params['timestamp'] = int(time.time() * 1000)
     query = '&'.join(f'{k}={v}' for k, v in params.items())
     sig = hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
     params['signature'] = sig
     return params
 
-def get(path, params={}):
-    r = requests.get(BASE_URL + path, params=sign(dict(params)),
+def _get(path, params=None):
+    r = requests.get(BASE_URL + path, params=_sign(dict(params or {})),
                      headers={'X-MBX-APIKEY': API_KEY}, timeout=10)
     return r.json()
 
-def post(path, params={}):
-    r = requests.post(BASE_URL + path, params=sign(dict(params)),
+def _post(path, params=None):
+    r = requests.post(BASE_URL + path, params=_sign(dict(params or {})),
                       headers={'X-MBX-APIKEY': API_KEY}, timeout=10)
     return r.json()
 
 def get_balance() -> float:
-    acc = get('/api/v3/account')
-    for b in acc.get('balances', []):
+    for b in _get('/api/v3/account').get('balances', []):
         if b['asset'] == 'USDT':
             return float(b['free'])
     return 0.0
 
 def get_position() -> dict:
-    acc = get('/api/v3/account')
-    for b in acc.get('balances', []):
+    for b in _get('/api/v3/account').get('balances', []):
         if b['asset'] == 'BTC':
             qty = float(b['free']) + float(b['locked'])
             if qty > 0.0001:
@@ -67,160 +85,145 @@ def get_position() -> dict:
 
 def get_klines(limit=250) -> list:
     r = requests.get(f'{BASE_URL}/api/v3/klines',
-                     params={'symbol': SYMBOL, 'interval': '4h', 'limit': limit}, timeout=10)
+                     params={'symbol': SYMBOL, 'interval': INTERVAL, 'limit': limit}, timeout=10)
     return r.json()
 
 def place_order(side: str, qty: float) -> dict:
-    return post('/api/v3/order', {
+    return _post('/api/v3/order', {
         'symbol': SYMBOL, 'side': side,
         'type': 'MARKET', 'quantity': f'{qty:.5f}',
     })
 
 
 # ── Indicators ────────────────────────────────────────────────────────────────
+# Split into TRADING (gates decisions) and DASHBOARD (display-only).
+# Only TRADING indicators interfere with logic.
 
-def calc_indicators(klines: list) -> dict:
+def _ema(data, n):
+    k = 2/(n+1); e = data[0]
+    for p in data[1:]: e = p*k + e*(1-k)
+    return e
+
+def _ema_arr(data, n):
+    k = 2/(n+1); out = [data[0]]
+    for p in data[1:]: out.append(p*k + out[-1]*(1-k))
+    return out
+
+def _atr(h, l, c, n=14):
+    trs = [max(h[i]-l[i], abs(h[i]-c[i-1]), abs(l[i]-c[i-1])) for i in range(1, len(h))]
+    return sum(trs[-n:]) / n
+
+def _rsi(data, n=14):
+    gains  = [max(data[i]-data[i-1], 0) for i in range(1, len(data))]
+    losses = [max(data[i-1]-data[i], 0) for i in range(1, len(data))]
+    ag = sum(gains[-n:])/n; al = sum(losses[-n:])/n
+    return 100 - (100/(1+ag/al)) if al > 0 else 100
+
+def _adx(h, l, c, n=14):
+    """Wilder ADX. Returns (adx, +DI, -DI)."""
+    pdm, ndm, trs = [], [], []
+    for i in range(1, len(h)):
+        up   = h[i] - h[i-1]
+        dn   = l[i-1] - l[i]
+        pdm.append(up if (up > dn and up > 0) else 0.0)
+        ndm.append(dn if (dn > up and dn > 0) else 0.0)
+        trs.append(max(h[i]-l[i], abs(h[i]-c[i-1]), abs(l[i]-c[i-1])))
+    if len(trs) < n*2: return 0.0, 0.0, 0.0
+    atr_s = sum(trs[:n]) / n
+    pdi_s = sum(pdm[:n]) / n
+    ndi_s = sum(ndm[:n]) / n
+    dxs = []
+    for i in range(n, len(trs)):
+        atr_s = (atr_s * (n-1) + trs[i]) / n
+        pdi_s = (pdi_s * (n-1) + pdm[i]) / n
+        ndi_s = (ndi_s * (n-1) + ndm[i]) / n
+        pdi = 100 * pdi_s / atr_s if atr_s else 0
+        ndi = 100 * ndi_s / atr_s if atr_s else 0
+        dxs.append(100 * abs(pdi-ndi) / (pdi+ndi) if (pdi+ndi) else 0)
+    adx = sum(dxs[-n:]) / min(len(dxs), n) if dxs else 0
+    return adx, pdi, ndi
+
+def trading_signals(klines: list) -> dict:
+    """Indicators that GATE trading decisions. Nothing else."""
+    closes = [float(k[4]) for k in klines]
+    highs  = [float(k[2]) for k in klines]
+    lows   = [float(k[3]) for k in klines]
+
+    fast = _ema_arr(closes, 12); slow = _ema_arr(closes, 26)
+    macd_line = [f-s for f,s in zip(fast, slow)]
+    macd_sig  = _ema_arr(macd_line, 9)
+    adx_v, pdi, ndi = _adx(highs, lows, closes)
+
+    return {
+        'price':    closes[-1],
+        'ema21':    _ema(closes[-50:],  21),
+        'ema55':    _ema(closes[-100:], 55),
+        'ema200':   _ema(closes,       200),
+        'atr':      _atr(highs, lows, closes),
+        'rsi':      _rsi(closes),
+        'macd':     macd_line[-1],
+        'macd_sig': macd_sig[-1],
+        'adx':      adx_v,
+        'pdi':      pdi,
+        'ndi':      ndi,
+    }
+
+
+def dashboard_extras(klines: list) -> dict:
+    """Indicators for the public status page. Do NOT influence trading."""
     closes  = [float(k[4]) for k in klines]
     highs   = [float(k[2]) for k in klines]
     lows    = [float(k[3]) for k in klines]
     volumes = [float(k[5]) for k in klines]
 
-    def ema(data, n):
-        k = 2/(n+1); e = data[0]
-        for p in data[1:]: e = p*k + e*(1-k)
-        return e
+    # Bollinger Bands (20, 2σ)
+    n = 20
+    recent = closes[-n:]
+    mid = sum(recent) / n
+    sd  = (sum((p - mid)**2 for p in recent) / n) ** 0.5
+    up, lo = mid + 2*sd, mid - 2*sd
+    pct_b = (closes[-1] - lo) / (up - lo) if (up - lo) else 0.5
 
-    def ema_arr(data, n):
-        k = 2/(n+1); out = [data[0]]
-        for p in data[1:]: out.append(p*k + out[-1]*(1-k))
-        return out
+    # Rolling VWAP (last 24 candles ≈ 4 days)
+    typ = [(highs[i]+lows[i]+closes[i])/3 for i in range(len(closes))][-24:]
+    vols = volumes[-24:]
+    vwap_v = sum(t*v for t, v in zip(typ, vols)) / sum(vols) if sum(vols) > 0 else closes[-1]
 
-    def atr(h, l, c, n=14):
-        trs = [max(h[i]-l[i], abs(h[i]-c[i-1]), abs(l[i]-c[i-1])) for i in range(1, len(h))]
-        return sum(trs[-n:]) / n
+    # Stochastic RSI (%K)
+    rsis = []
+    for end in range(15, len(closes) + 1):
+        w = closes[end-15:end]
+        gains  = [max(w[i]-w[i-1], 0) for i in range(1, len(w))]
+        losses = [max(w[i-1]-w[i], 0) for i in range(1, len(w))]
+        ag = sum(gains)/14; al = sum(losses)/14
+        rsis.append(100 - (100/(1+ag/al)) if al > 0 else 100)
+    rmax, rmin = max(rsis[-14:]), min(rsis[-14:])
+    stoch = (rsis[-1] - rmin) / (rmax - rmin) * 100 if rmax != rmin else 50.0
 
-    def rsi(data, n=14):
-        gains  = [max(data[i]-data[i-1], 0) for i in range(1, len(data))]
-        losses = [max(data[i-1]-data[i], 0) for i in range(1, len(data))]
-        ag = sum(gains[-n:])/n; al = sum(losses[-n:])/n
-        return 100 - (100/(1+ag/al)) if al > 0 else 100
-
-    # ── Pro indicators ────────────────────────────────────────────────────
-
-    def adx(h, l, c, n=14):
-        """Wilder's ADX — trend strength. >25 trending, <20 choppy."""
-        pdm, ndm, trs = [], [], []
-        for i in range(1, len(h)):
-            up_move   = h[i] - h[i-1]
-            down_move = l[i-1] - l[i]
-            pdm.append(up_move   if (up_move   > down_move and up_move   > 0) else 0.0)
-            ndm.append(down_move if (down_move > up_move   and down_move > 0) else 0.0)
-            trs.append(max(h[i]-l[i], abs(h[i]-c[i-1]), abs(l[i]-c[i-1])))
-        if len(trs) < n*2: return 0.0, 0.0, 0.0
-        atr_s = sum(trs[:n]) / n
-        pdi_s = sum(pdm[:n]) / n
-        ndi_s = sum(ndm[:n]) / n
-        dxs = []
-        for i in range(n, len(trs)):
-            atr_s = (atr_s * (n-1) + trs[i]) / n
-            pdi_s = (pdi_s * (n-1) + pdm[i]) / n
-            ndi_s = (ndi_s * (n-1) + ndm[i]) / n
-            pdi = 100 * pdi_s / atr_s if atr_s else 0
-            ndi = 100 * ndi_s / atr_s if atr_s else 0
-            dx  = 100 * abs(pdi-ndi) / (pdi+ndi) if (pdi+ndi) else 0
-            dxs.append(dx)
-        adx_val = sum(dxs[-n:]) / min(len(dxs), n) if dxs else 0
-        return adx_val, pdi, ndi
-
-    def bollinger(closes_list, n=20, k=2):
-        """20-period, 2σ bands. Returns mid/upper/lower/%B/width%."""
-        recent = closes_list[-n:]
-        mid = sum(recent) / n
-        var = sum((p - mid)**2 for p in recent) / n
-        sd  = var ** 0.5
-        up, lo = mid + k*sd, mid - k*sd
-        cur = closes_list[-1]
-        pct_b = (cur - lo) / (up - lo) if (up - lo) else 0.5
-        width = (up - lo) / mid * 100
-        return {'upper': up, 'mid': mid, 'lower': lo, 'pct_b': pct_b, 'width_pct': width}
-
-    def vwap(h, l, c, v, n=24):
-        """Rolling VWAP over last n candles (=4 days on 4h)."""
-        typ = [(h[i]+l[i]+c[i])/3 for i in range(len(c))][-n:]
-        vols = v[-n:]
-        tot_vol = sum(vols)
-        if tot_vol == 0: return c[-1]
-        return sum(t*vol for t, vol in zip(typ, vols)) / tot_vol
-
-    def stoch_rsi(closes_list, rsi_n=14, stoch_n=14):
-        """%K of Stoch RSI. Faster than plain RSI."""
-        if len(closes_list) < rsi_n + stoch_n + 2: return 50.0
-        # Compute trailing RSI series
-        rsis = []
-        for end in range(rsi_n + 1, len(closes_list) + 1):
-            window = closes_list[end - rsi_n - 1 : end]
-            gains  = [max(window[i]-window[i-1], 0) for i in range(1, len(window))]
-            losses = [max(window[i-1]-window[i], 0) for i in range(1, len(window))]
-            ag = sum(gains)/rsi_n; al = sum(losses)/rsi_n
-            rsis.append(100 - (100/(1+ag/al)) if al > 0 else 100)
-        recent = rsis[-stoch_n:]
-        rmax, rmin = max(recent), min(recent)
-        if rmax == rmin: return 50.0
-        return (rsis[-1] - rmin) / (rmax - rmin) * 100
-
-    def obv_trend(c, v):
-        """OBV cumulative; compare last 24-bar avg vs previous 24-bar avg."""
-        obv_val = 0.0
-        series = [0.0]
-        for i in range(1, len(c)):
-            if c[i] > c[i-1]:   obv_val += v[i]
-            elif c[i] < c[i-1]: obv_val -= v[i]
-            series.append(obv_val)
-        if len(series) < 48: return obv_val, 'neutral'
-        recent = sum(series[-24:]) / 24
-        prev   = sum(series[-48:-24]) / 24
-        if prev == 0: return obv_val, 'neutral'
-        ratio = (recent - prev) / abs(prev) if prev != 0 else 0
-        if ratio > 0.05:  return obv_val, 'bullish'
-        if ratio < -0.05: return obv_val, 'bearish'
-        return obv_val, 'neutral'
-
-    fast = ema_arr(closes, 12); slow = ema_arr(closes, 26)
-    macd_line = [f-s for f,s in zip(fast, slow)]
-    macd_sig  = ema_arr(macd_line, 9)
-
-    adx_val, pdi, ndi = adx(highs, lows, closes)
-    bb               = bollinger(closes)
-    vwap_val         = vwap(highs, lows, closes, volumes)
-    stoch_r          = stoch_rsi(closes)
-    obv_val, obv_lbl = obv_trend(closes, volumes)
+    # OBV trend
+    obv = 0.0; series = [0.0]
+    for i in range(1, len(closes)):
+        if closes[i] > closes[i-1]:   obv += volumes[i]
+        elif closes[i] < closes[i-1]: obv -= volumes[i]
+        series.append(obv)
+    if len(series) >= 48:
+        r24 = sum(series[-24:]) / 24
+        p24 = sum(series[-48:-24]) / 24
+        ratio = (r24 - p24) / abs(p24) if p24 != 0 else 0
+        obv_lbl = 'bullish' if ratio > 0.05 else 'bearish' if ratio < -0.05 else 'neutral'
+    else:
+        obv_lbl = 'neutral'
 
     return {
-        'price':       closes[-1],
-        'ema21':       ema(closes[-50:],  21),
-        'ema55':       ema(closes[-100:], 55),
-        'ema200':      ema(closes,       200),
-        'atr':         atr(highs, lows, closes),
-        'rsi':         rsi(closes),
-        'macd':        macd_line[-1],
-        'macd_sig':    macd_sig[-1],
-        # ── New pro indicators ──
-        'adx':         adx_val,
-        'pdi':         pdi,
-        'ndi':         ndi,
-        'bb_upper':    bb['upper'],
-        'bb_mid':      bb['mid'],
-        'bb_lower':    bb['lower'],
-        'bb_pct_b':    bb['pct_b'],
-        'bb_width':    bb['width_pct'],
-        'vwap':        vwap_val,
-        'stoch_rsi':   stoch_r,
-        'obv':         obv_val,
-        'obv_trend':   obv_lbl,
+        'bb_upper': up, 'bb_mid': mid, 'bb_lower': lo,
+        'bb_pct_b': pct_b, 'bb_width': (up - lo) / mid * 100,
+        'vwap': vwap_v,
+        'stoch_rsi': stoch,
+        'obv': obv, 'obv_trend': obv_lbl,
     }
 
 
-# ── State & P&L ───────────────────────────────────────────────────────────────
+# ── State, P&L, locks ────────────────────────────────────────────────────────
 
 def load_state() -> dict:
     return json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
@@ -241,34 +244,43 @@ def log_trade(action: str, price: float, qty: float, pnl: float = 0, reason: str
 def get_daily_pnl() -> float:
     if not PNL_LOG.exists(): return 0.0
     today = date.today().isoformat()
-    log = json.loads(PNL_LOG.read_text())
-    return sum(t['pnl_after_fees'] for t in log if t['ts'].startswith(today) and 'pnl_after_fees' in t)
+    return sum(t.get('pnl_after_fees', 0) for t in json.loads(PNL_LOG.read_text())
+               if t['ts'].startswith(today))
+
+def acquire_lock() -> bool:
+    if LOCK_FILE.exists():
+        if time.time() - LOCK_FILE.stat().st_mtime < 300:
+            return False
+        LOCK_FILE.unlink()
+    LOCK_FILE.write_text(str(os.getpid()))
+    return True
+
+def release_lock():
+    try: LOCK_FILE.unlink()
+    except: pass
 
 def verify_position_on_startup(state: dict, pos: dict) -> dict:
-    """If we have a BTC position but no state entry_price, recover from exchange."""
-    if pos and not state.get('entry_price'):
-        # Try to get last fill price from recent trades
-        try:
-            trades = get('/api/v3/myTrades', {'symbol': SYMBOL, 'limit': 5})
-            buys = [t for t in trades if t.get('isBuyer')]
-            if buys:
-                fill = float(buys[-1]['price'])
-                atr_est = float(buys[-1]['price']) * 0.015  # ~1.5% ATR estimate
-                state.update({
-                    'entry_price': fill,
-                    'stop_loss':   fill - ATR_SL * atr_est,
-                    'take_profit': fill + ATR_TP * atr_est,
-                    'qty':         pos['qty'],
-                    'bars_held':   0,
-                    'recovered':   True,
-                })
-                notify(f'⚠️ Recovered position: {pos["qty"]:.5f} BTC @ ${fill:,.2f}')
-        except Exception as e:
-            print(f'  Position recovery failed: {e}')
+    """If exchange shows BTC but state has no entry, recover from trade history."""
+    if not pos or state.get('entry_price'): return state
+    try:
+        trades = _get('/api/v3/myTrades', {'symbol': SYMBOL, 'limit': 5})
+        buys = [t for t in trades if t.get('isBuyer')]
+        if buys:
+            fill = float(buys[-1]['price'])
+            atr_est = fill * 0.015
+            state.update({
+                'entry_price': fill,
+                'stop_loss':   fill - ATR_SL * atr_est,
+                'take_profit': fill + ATR_TP * atr_est,
+                'qty':         pos['qty'],
+                'entered_at':  datetime.now().isoformat(),
+                'recovered':   True,
+            })
+            notify(f'⚠️ Recovered position: {pos["qty"]:.5f} BTC @ ${fill:,.2f}')
+    except Exception as e:
+        print(f'  Recovery failed: {e}')
     return state
 
-
-# ── Notifications ─────────────────────────────────────────────────────────────
 
 def notify(msg: str):
     try:
@@ -279,42 +291,114 @@ def notify(msg: str):
     print(msg)
 
 
-# ── Duplicate order guard ─────────────────────────────────────────────────────
+# ── Main loop ────────────────────────────────────────────────────────────────
 
-def acquire_lock() -> bool:
-    if LOCK_FILE.exists():
-        age = time.time() - LOCK_FILE.stat().st_mtime
-        if age < 300:  # 5 min — another instance is running
-            return False
-        LOCK_FILE.unlink()  # stale lock
-    LOCK_FILE.write_text(str(os.getpid()))
-    return True
+def _run():
+    print(f'\n[{datetime.now().strftime("%Y-%m-%d %H:%M")}] BTC Live Bot running...')
 
-def release_lock():
-    try: LOCK_FILE.unlink()
-    except: pass
+    klines = get_klines(250)
+    if len(klines) < 210:
+        print('Not enough candles'); return
 
+    sig   = trading_signals(klines)
+    extra = dashboard_extras(klines)
 
-# ── News sentiment ────────────────────────────────────────────────────────────
+    price, ema21, ema55, ema200 = sig['price'], sig['ema21'], sig['ema55'], sig['ema200']
+    atr, rsi, macd, macd_sig    = sig['atr'], sig['rsi'], sig['macd'], sig['macd_sig']
+    adx_v                       = sig['adx']
 
-def get_news(state: dict) -> tuple[float, dict]:
-    """Returns (weighted_score, news_dict). Score is confidence-weighted: -1 to +1."""
-    news = state.get('news', {'score': 0, 'confidence': 0.5, 'reason': 'not fetched'})
-    last = state.get('last_news_ts', '')
-    if not last or (datetime.now() - datetime.fromisoformat(last)).total_seconds() > 14400:
-        try:
-            from news_sentiment import get_news_signal
-            news = get_news_signal()
-            state['news'] = news
-            state['last_news_ts'] = datetime.now().isoformat()
-        except Exception as e:
-            print(f'  News fetch failed: {e}')
-    # Confidence-weighted score: e.g. score=+1, conf=0.6 → weighted=0.6
-    weighted = news.get('score', 0) * news.get('confidence', 0.5)
-    return weighted, news
+    state = load_state()
+    pos   = get_position()
+    state = verify_position_on_startup(state, pos)
 
+    print(f'  Price: ${price:,.2f} | RSI: {rsi:.1f} | MACD: {"▲" if macd>macd_sig else "▼"} | ADX: {adx_v:.1f} ({"trending" if adx_v>=ADX_MIN else "chop"})')
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+    # Write indicators snapshot for the public dashboard
+    try:
+        INDICATORS_FILE.write_text(json.dumps({
+            'ts':        datetime.now().isoformat(),
+            **sig, **extra,
+            'has_pos':   bool(pos),
+            'daily_pnl': get_daily_pnl(),
+        }, indent=2))
+    except Exception: pass
+
+    # ── In a position: manage exit ──────────────────────────────────────
+    if pos:
+        entry = state.get('entry_price', price)
+        sl    = state.get('stop_loss',   price - ATR_SL * atr)
+        tp    = state.get('take_profit', price + ATR_TP * atr)
+        upnl_pct = (price - entry) / entry * 100
+
+        # Trailing stop
+        if upnl_pct >= TRAIL_BE_PCT:   sl = max(sl, entry)
+        if upnl_pct >= TRAIL_ATR_PCT:  sl = max(sl, price - atr)
+        state['stop_loss'] = sl
+
+        print(f'  Position: {pos["qty"]:.5f} BTC | Entry: ${entry:,.2f} | SL: ${sl:,.2f} | TP: ${tp:,.2f} | PnL: {upnl_pct:+.2f}%')
+
+        if price <= sl or price >= tp:
+            reason = 'TP' if price >= tp else 'SL'
+            result = place_order('SELL', pos['qty'])
+            if result.get('status') != 'FILLED':
+                notify(f'⚠️ SELL order failed: {result}')
+                save_state(state)
+                return
+            pnl     = (price - entry) * pos['qty']
+            pnl_net = pnl - 2 * FEE_RATE * price * pos['qty']
+            log_trade('SELL', price, pos['qty'], pnl, reason)
+            notify(f'SELL {pos["qty"]:.5f} BTC @ ${price:,.2f} | Net P&L: ${pnl_net:+,.2f} | {reason}')
+            save_state({})
+        else:
+            save_state(state)
+        return
+
+    # ── No position: scan for entry ─────────────────────────────────────
+    cond_macro  = price > ema200
+    cond_trend  = ema21 > ema55
+    cond_rsi    = RSI_LO <= rsi <= RSI_HI
+    cond_macd   = macd > macd_sig
+    cond_adx    = adx_v >= ADX_MIN
+    entry_ok    = cond_macro and cond_trend and cond_rsi and cond_macd and cond_adx
+
+    if not entry_ok:
+        blocked = []
+        if not cond_macro:  blocked.append('price<EMA200')
+        if not cond_trend:  blocked.append('EMA bearish')
+        if not cond_rsi:    blocked.append(f'RSI={rsi:.0f}')
+        if not cond_macd:   blocked.append('MACD bearish')
+        if not cond_adx:    blocked.append(f'ADX={adx_v:.0f}<{ADX_MIN}')
+        print(f'  No position | ❌ Waiting: {", ".join(blocked)}')
+        return
+
+    # Sizing: risk RISK_PCT per trade, hard-cap at MAX_POSITION_PCT of equity
+    usdt     = get_balance()
+    sl_price = price - ATR_SL * atr
+    tp_price = price + ATR_TP * atr
+    risk_per_unit = price - sl_price
+
+    qty_by_risk = (usdt * RISK_PCT) / risk_per_unit
+    qty_by_cap  = (usdt * MAX_POSITION_PCT) / price
+    qty = round(min(qty_by_risk, qty_by_cap), 5)
+
+    if qty < 0.0001 or usdt < 10:
+        print(f'  Skipped — qty {qty} too small or usdt {usdt} too low')
+        return
+
+    result = place_order('BUY', qty)
+    if result.get('status') != 'FILLED':
+        print(f'  Order failed: {result}')
+        return
+
+    fill = float(result.get('fills', [{}])[0].get('price', price))
+    fee  = 2 * FEE_RATE * fill * qty
+    save_state({
+        'entry_price': fill, 'stop_loss': sl_price, 'take_profit': tp_price,
+        'qty': qty, 'entered_at': datetime.now().isoformat(),
+    })
+    log_trade('BUY', fill, qty, -fee, 'entry')
+    notify(f'BUY {qty:.5f} BTC @ ${fill:,.2f} | SL ${sl_price:,.2f} | TP ${tp_price:,.2f} | Fee ${fee:.2f}')
+
 
 def run():
     if not acquire_lock():
@@ -328,147 +412,14 @@ def run():
         release_lock()
 
 
-def _run():
-    print(f'\n[{datetime.now().strftime("%Y-%m-%d %H:%M")}] BTC Live Bot running...')
-
-    daily_pnl = get_daily_pnl()  # kept for the dashboard, no longer a circuit breaker
-
-    klines = get_klines(250)
-    if len(klines) < 210:
-        print('Not enough candles'); return
-
-    ind      = calc_indicators(klines)
-    price    = ind['price']
-    ema21    = ind['ema21']
-    ema55    = ind['ema55']
-    ema200   = ind['ema200']
-    atr      = ind['atr']
-    rsi      = ind['rsi']
-    macd     = ind['macd']
-    macd_sig = ind['macd_sig']
-
-    state = load_state()
-    pos   = get_position()
-    state = verify_position_on_startup(state, pos)
-
-    news_weighted, news = get_news(state)
-    news_emoji = '🟢' if news_weighted > 0.3 else '🔴' if news_weighted < -0.3 else '🟡'
-
-    print(f'  Price: ${price:,.2f} | RSI: {rsi:.1f} | MACD: {"▲" if macd>macd_sig else "▼"} | News: {news_emoji}({news_weighted:+.2f}) | Daily PnL: ${daily_pnl:+,.2f}')
-
-    # Snapshot every indicator for the status page (no trading logic)
-    try:
-        Path(__file__).parent.joinpath('indicators.json').write_text(json.dumps({
-            'ts':       datetime.now().isoformat(),
-            'price':    price,
-            'ema21':    ema21, 'ema55': ema55, 'ema200': ema200,
-            'atr':      atr,
-            'rsi':      rsi,
-            'macd':     macd, 'macd_sig': macd_sig,
-            'news':     news_weighted,
-            'daily_pnl': daily_pnl,
-            'has_pos':  bool(pos),
-            # Pro indicators
-            'adx':       ind.get('adx', 0),
-            'pdi':       ind.get('pdi', 0),
-            'ndi':       ind.get('ndi', 0),
-            'bb_upper':  ind.get('bb_upper', 0),
-            'bb_mid':    ind.get('bb_mid', 0),
-            'bb_lower':  ind.get('bb_lower', 0),
-            'bb_pct_b':  ind.get('bb_pct_b', 0.5),
-            'bb_width':  ind.get('bb_width', 0),
-            'vwap':      ind.get('vwap', 0),
-            'stoch_rsi': ind.get('stoch_rsi', 50),
-            'obv':       ind.get('obv', 0),
-            'obv_trend': ind.get('obv_trend', 'neutral'),
-        }, indent=2))
-    except Exception as _: pass
-
-    if pos:
-        entry = state.get('entry_price', price)
-        sl    = state.get('stop_loss',   price - ATR_SL * atr)
-        tp    = state.get('take_profit', price + ATR_TP * atr)
-        bars  = state.get('bars_held', 0) + 1
-        state['bars_held'] = bars
-
-        unrealized_pct = (price - entry) / entry * 100
-        if unrealized_pct > 3:  sl = max(sl, entry);       state['stop_loss'] = sl
-        if unrealized_pct > 5:  sl = max(sl, price - atr); state['stop_loss'] = sl
-
-        # Pure SL/TP exits — time-based EMA-cross exit removed (backtest: +0.52% over 4y)
-        exit_signal = price <= sl or price >= tp
-        print(f'  Position: {pos["qty"]:.5f} BTC | Entry: ${entry:,.2f} | SL: ${sl:,.2f} | TP: ${tp:,.2f} | PnL: {unrealized_pct:+.2f}%')
-
-        if exit_signal:
-            reason = 'SL' if price <= sl else 'TP'
-            result = place_order('SELL', pos['qty'])
-            if result.get('status') != 'FILLED':
-                notify(f'⚠️ SELL order failed: {result}')
-                save_state(state)
-                return
-            pnl = (price - entry) * pos['qty']
-            pnl_net = pnl - 2 * FEE_RATE * price * pos['qty']
-            log_trade('SELL', price, pos['qty'], pnl, reason)
-            notify(f'SELL {pos["qty"]:.5f} BTC @ ${price:,.2f} | Net PnL: ${pnl_net:+,.2f} | {reason}')
-            save_state({})
-        else:
-            save_state(state)
-
-    else:
-        # ADX > 25 filter — proven in backtest to lift win rate 63.9% → 68.5% and flip return to positive
-        adx_v = ind.get('adx', 0)
-        ADX_MIN = 25
-
-        # Entry signal — backtest-validated filters only.
-        # News removed as a gate (still fetched for display); daily loss circuit removed (never triggered).
-        entry_signal = (
-            price > ema200 and ema21 > ema55 and
-            RSI_LO <= rsi <= RSI_HI and
-            macd > macd_sig and
-            adx_v >= ADX_MIN            # trend strength filter (backtested: +4.6pp WR)
-        )
-
-        if not entry_signal:
-            blocked_by = []
-            if price <= ema200:       blocked_by.append('price<EMA200')
-            if ema21 <= ema55:        blocked_by.append('EMA bearish')
-            if not (RSI_LO<=rsi<=RSI_HI): blocked_by.append(f'RSI={rsi:.0f}')
-            if macd <= macd_sig:      blocked_by.append('MACD bearish')
-            if adx_v < ADX_MIN:       blocked_by.append(f'ADX={adx_v:.0f}<{ADX_MIN}')
-            print(f'  No position | ❌ Waiting: {", ".join(blocked_by)}')
-        else:
-            # Fixed risk-based position sizing (news-based boost removed — not backtested)
-            risk = RISK_PCT
-            usdt    = get_balance()
-            sl_price = price - ATR_SL * atr
-            tp_price = price + ATR_TP * atr
-            qty = min(usdt * risk / (price - sl_price), usdt * 0.95 / price)
-            qty = round(qty, 5)
-
-            if qty > 0.0001 and usdt > 10:
-                result = place_order('BUY', qty)
-                if result.get('status') == 'FILLED':
-                    fill = float(result.get('fills', [{}])[0].get('price', price))
-                    fee_cost = 2 * FEE_RATE * fill * qty
-                    save_state({
-                        'entry_price': fill, 'stop_loss': sl_price,
-                        'take_profit': tp_price, 'qty': qty,
-                        'bars_held': 0, 'entered_at': datetime.now().isoformat(),
-                    })
-                    log_trade('BUY', fill, qty, -fee_cost, 'entry')
-                    notify(f'BUY {qty:.5f} BTC @ ${fill:,.2f} | SL: ${sl_price:,.2f} | TP: ${tp_price:,.2f} | Fee: ${fee_cost:.2f}')
-                else:
-                    print(f'  Order failed: {result}')
-
-
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--loop', action='store_true', help='Run continuously every 5 minutes')
+    parser.add_argument('--loop', action='store_true', help='Run continuously every 5 min')
     args = parser.parse_args()
 
     if args.loop:
-        print('Running in loop mode (every 5 minutes)...')
+        print('Running in loop mode (5 min cycle)...')
         while True:
             run()
             time.sleep(300)
